@@ -11,32 +11,43 @@
 - **亮/暗双主题**：思源宋体分组标题、可换字体字号、透明度滑杆
 - **撤销删除**：删除后底部弹出撤销条，可反悔
 - **数据持久化**：待办与设置保存在 `%APPDATA%`，重启、移动 exe 均不丢数据
-- **开机自启**：通过 Windows 启动文件夹快捷方式实现，无需写注册表
+- **开机自启**：通过 Windows 注册表 Run 键实现，路径变更时下次启动自动自愈
 
 ## 文件说明
 
 | 文件 | 作用 |
 | --- | --- |
-| `桌面待办清单.py` | 主程序，全部功能都在这一个文件里 |
-| `启动待办清单.bat` | 双击运行（等价于 `pythonw 桌面待办清单.py`） |
-| `打包exe.bat` | 一键用 PyInstaller 打包成单文件 exe |
+| `main.py` | 程序入口 |
+| `desktop_todo/` | 主程序包（模块化结构，见下） |
+| `启动待办清单.bat` | 双击运行（等价于 `pythonw main.py`） |
+
+`desktop_todo/` 包结构：
+
+| 模块 | 职责 |
+| --- | --- |
+| `constants.py` | 常量：主题配色、字号档位、色键、抖动矩阵 |
+| `storage.py` | 数据目录定位与 JSON 原子读写（.bak 备份） |
+| `autostart.py` | 开机自启动（注册表 Run 键） |
+| `utils.py` | DPI 感知、可点击标记、颜色明暗计算 |
+| `widgets.py` | 自定义控件（矩形滑块开关 Switch） |
+| `todo_item.py` | 单条待办卡片 |
+| `dialogs.py` | 弹窗：新建待办 / 设置 / 字体选择 |
+| `app.py` | 主程序 TodoApp（窗口、布局、排序动画、贴边缩放） |
 
 ## 运行
 
 需要 Windows + Python 3（安装时勾选 "Add python.exe to PATH"）：
 
 ```
-pythonw 桌面待办清单.py
+pythonw main.py
 ```
 
 或直接双击 `启动待办清单.bat`。
 
 ## 打包为 exe
 
-双击 `打包exe.bat`，自动安装 PyInstaller 并打包，产物在 `dist\桌面待办清单.exe`。等价手动命令：
-
 ```
-python -m PyInstaller --onefile --noconsole --name "桌面待办清单" "桌面待办清单.py"
+python -m PyInstaller --onefile --noconsole --name "Desktop Sticky" main.py
 ```
 
 ## 数据位置
