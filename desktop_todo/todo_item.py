@@ -278,7 +278,7 @@ class TodoItem:
     def _commit_edit(self):
         if not self._edit_entry:
             return
-        text = self._edit_entry.get().strip()
+        text = self._edit_entry.get().rstrip()
         self._edit_entry = None
         self.app._editing_item = None
         if text and text != self.todo["text"]:

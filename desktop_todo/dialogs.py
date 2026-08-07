@@ -48,7 +48,7 @@ def open_add_dialog(app):
         anchor="w")
 
     def commit(_e=None):
-        text = entry.get().strip()
+        text = entry.get().rstrip()
         if text:
             app._add_todo_text(text)
         close()
