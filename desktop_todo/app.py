@@ -11,7 +11,7 @@ import sys
 import tkinter as tk
 from tkinter import font as tkfont
 
-from . import dialogs, storage
+from . import dialogs, dockguard, storage
 from .autostart import entry_script, get_autostart_value, set_autostart
 from .constants import (_BAYER8, CURSOR_NS, CURSOR_NWSE, CURSOR_WE, EDGE,
                         HEADER_H, KEY, MIN_H, MIN_W, SIZE_CHOICES, THEMES,
@@ -29,11 +29,13 @@ class TodoApp:
         self._next_id = max([t.get("id", 0) for t in self.todos], default=0) + 1
         self.item_widgets = {}
         self._item_wins = {}
+        self._item_top = {}
         self._resize_mode = None
         self._dragging = False
         self._save_after = None
         self._restack_job = None
         self._heal_job = None
+        self._warmup_job = None
         self._last_cursor = None
         self._last_cw = 0
         self._undo_stack = []
@@ -56,6 +58,7 @@ class TodoApp:
         self._reorder = None
         self._editing_item = None
         self._chrome_after = None
+        self._painting = False
 
         self.theme = THEMES.get(self.config.get("theme"), THEMES["亮色"])
         self.font_family = self.config.get("font_family", "微软雅黑")
@@ -110,6 +113,14 @@ class TodoApp:
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
         self.root.bind("<Destroy>", self._on_destroy)
         self._heal_job = self.root.after(800, self._heal_autostart)
+        # 冷启动预热：界面落定后趁空闲把首交互路径预演一遍（详见 _warmup）
+        self._warmup_job = self.root.after(350, self._warmup)
+
+        # 桌面防埋守卫：仅在非置顶时轮询，防止 Win+D「显示桌面」后
+        # 组件被桌面图层压盖且无法找回（置顶模式下系统本就免疫）
+        self._guard = dockguard.DesktopGuard(self)
+        if not self.topmost:
+            self._guard.start()
 
     # ========== 工具 ==========
     def lerp(self, c1, c2, t):
@@ -120,7 +131,7 @@ class TodoApp:
 
     def _cancel_jobs(self):
         for attr in ("_restack_job", "_save_after", "_undo_after",
-                     "_error_after", "_heal_job"):
+                     "_error_after", "_heal_job", "_warmup_job"):
             job = getattr(self, attr, None)
             if job:
                 try:
@@ -131,6 +142,8 @@ class TodoApp:
 
     def _on_destroy(self, e):
         if e.widget is self.root:
+            if self._guard:
+                self._guard.stop()
             self._cancel_jobs()
 
     def font(self, family, size, weight="normal", overstrike=False):
@@ -173,6 +186,66 @@ class TodoApp:
         self._stipples[key] = ref
         return ref
 
+    # ========== 冷启动预热 ==========
+    def _warmup(self):
+        """空闲预热：把首几次点击/拖动的“首次”开销提前到启动后空闲时完成。
+
+        首几次交互动画卡顿的根因是一串惰性初始化全堆在第一次操作上：
+        - 删除线字体 / 删除键字体的首次创建（GDI 字体加载）
+        - XBM 点阵位图的首次磁盘读取与 Tcl 位图注册
+        - 内嵌子窗口 / Entry 控件类的首次 HWND 创建（Windows 上最贵）
+        - 首次原子写盘（杀软对 .tmp 替换的首次扫描）
+        在一个屏外探针画布上各预演一次即可，之后交互全部命中热缓存。
+        """
+        self._warmup_job = None
+        try:
+            w = "bold" if self.font_bold else "normal"
+            f_norm = self.font(self.font_family, self.font_size, w)
+            f_done = self.font(self.font_family, self.font_size, w,
+                               overstrike=True)
+            f_del = (self.font_family, self.font_size + 2)
+            probe = tk.Canvas(self.root, bg=KEY, highlightthickness=0,
+                              bd=0, width=8, height=8)
+            probe.place(x=-5000, y=-5000)  # 屏外探针，永不可见
+            # 点阵位图：item 配置 stipple 时即载入 Tcl 位图缓存
+            for pct in (16, 72, self.chrome_opacity):
+                rid = probe.create_rectangle(
+                    0, 0, 8, 8, fill=self.theme["item"],
+                    stipple=self._stipple_for(pct))
+                probe.delete(rid)
+            # 文本渲染路径：普通 / 删除线 / 删除键字体各画一次
+            probe.create_text(0, 0, text="Aa 预", font=f_norm)
+            probe.create_text(0, 0, text="Aa 预", font=f_done)
+            probe.create_text(0, 0, text="✕", font=f_del)
+            # 内嵌子窗口创建/销毁（勾选置顶重建、拖拽替身共用此路径）
+            child = tk.Canvas(probe, bg=KEY, highlightthickness=0, bd=0,
+                              width=4, height=4)
+            cwin = probe.create_window(0, 0, window=child, anchor="nw")
+            # Entry 控件类（行内编辑首次弹出）
+            ent = tk.Entry(probe, font=f_norm)
+            ewin = probe.create_window(0, 0, window=ent, anchor="nw")
+            self.root.update_idletasks()
+            probe.delete(ewin)
+            ent.destroy()
+            probe.delete(cwin)
+            child.destroy()
+            probe.destroy()
+            # 首次磁盘原子写入路径（内容不变，等价于一次普通保存）
+            storage.save_json(storage.DATA_FILE, self.todos)
+        except Exception:
+            pass
+        self._warmup_tick()
+
+    def _warmup_tick(self, i=0):
+        """空转几拍 15ms 定时器：与滑动动画 _glide_win 同款的 after 链，
+        预热 Tcl 定时器，避免首个动画帧定时器惰性初始化造成起步卡顿。"""
+        if i >= 6:
+            return
+        try:
+            self.root.after(15, lambda: self._warmup_tick(i + 1))
+        except Exception:
+            pass
+
     def _apply_chrome(self):
         """透明度套用到窗口底板与所有卡片底色（文字与控件不受影响）。"""
         pct = self.chrome_opacity
@@ -191,6 +264,36 @@ class TodoApp:
             except Exception:
                 pass  # 重建瞬间的旧卡片引用，静默跳过
 
+    def _apply_height(self, h):
+        """设置窗口高度并同步布局（与 _do_resize 同路径）。"""
+        w = self.root.winfo_width()
+        self.root.geometry(f"{w}x{h}")
+        self._layout(force=True, size=(w, h))
+        self._flush_paints()
+
+    def _flush_paints(self):
+        """同帧完成绘制：先处理积压的 Configure 等事件（让各画布按新尺寸
+        排布重绘任务），再触发重绘，保证本函数返回时画面已是最新。
+        仅用 update_idletasks 不够：重绘任务要等事件队列里的 Configure
+        被处理后才会注册，期间的帧就是破洞。用带防重入守卫的 update
+        一次性处理完。"""
+        if self._painting:
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            return
+        self._painting = True
+        try:
+            self.root.update()
+        except Exception:
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
+        finally:
+            self._painting = False
+
     # ========== 界面构建 ==========
     def _build_ui(self):
         self._cancel_jobs()
@@ -201,8 +304,10 @@ class TodoApp:
         self._stipples = {}
         self._icon_items = {}
         self._icon_cx = {}
+        self._painting = False
         self.item_widgets = {}
         self._item_wins = {}
+        self._item_top = {}
         self._last_cw = 0
         self._reorder = None
         self._add_win = None
@@ -225,6 +330,11 @@ class TodoApp:
         self.grip_item = self.chrome.create_text(
             0, 0, text="◢", anchor="se", fill=th["sub"],
             font=(self.font_family, 10), tags="grip")
+        # 折叠提示：有待办被窗口下沿裁掉时，底部条带中央浮现一个小箭头。
+        # 纯展示、不响应任何交互（无标签，事件按普通底板处理）
+        self.hint_item = self.chrome.create_text(
+            0, 0, text="▾", anchor="s", fill=th["sub"], state="hidden",
+            font=(self.font_family, max(9, self.font_size - 1)))
 
         # ---- 滚动列表画布 ----
         self.canvas = tk.Canvas(self.chrome, bg=KEY, highlightthickness=0, bd=0)
@@ -254,7 +364,6 @@ class TodoApp:
         self.chrome.bind("<ButtonRelease-1>", self._chrome_release)
         self.chrome.bind("<Double-Button-1>", self._chrome_dblclick)
         self.canvas.bind("<Configure>", self._on_scroll_configure)
-        self._bind_wheel(self.canvas)
 
         self._last_layout_size = None
         self._apply_chrome()
@@ -330,9 +439,12 @@ class TodoApp:
         self._icon_cx[name] = (cx, cy)
 
     # ---------- 布局 ----------
-    def _layout(self, _e=None, force=False):
-        W = self.root.winfo_width()
-        H = self.root.winfo_height()
+    def _layout(self, _e=None, force=False, size=None):
+        if size is not None:
+            W, H = size  # 缩放拖拽时直接传入目标尺寸，绕过事件队列
+        else:
+            W = self.root.winfo_width()
+            H = self.root.winfo_height()
         # 窗口移动（位置变、尺寸不变）也会触发 Configure：
         # 尺寸没变就跳过重排，消除拖动窗口时的整屏闪烁
         if not force and (W, H) == self._last_layout_size:
@@ -348,24 +460,30 @@ class TodoApp:
         if self._collapsed:
             self.chrome.itemconfig(self.grip_item, state="hidden")
             self.chrome.itemconfig(self.scroll_win, state="hidden")
+            self._update_hint()
         else:
             self.chrome.itemconfig(self.grip_item, state="normal")
             self.chrome.coords(self.grip_item, W - 10, H - 8)
             list_y = HEADER_H + 8
             self.chrome.itemconfig(self.scroll_win, state="normal")
             self.chrome.coords(self.scroll_win, 14, list_y)
-            self.chrome.itemconfig(self.scroll_win, width=W - 28,
-                                   height=max(40, H - list_y - 26))
+            list_w, list_h = W - 28, max(40, H - list_y - 26)
+            self.chrome.itemconfig(self.scroll_win, width=list_w,
+                                   height=list_h)
+            self.chrome.coords(self.hint_item, W / 2, H - 3)
+            # 列表内部同步跟随：不等列表画布自己的 <Configure> 事件
+            self._sync_list(list_w, list_h)
 
     # ---------- 列表内部布局 ----------
-    def _on_scroll_configure(self, e):
-        """纯纵向变化：O(1) 坐标更新，零重排。
-        宽度变化：卡片边框即时跟随（廉价），文字重排防抖。"""
-        self.canvas.coords(self.list_bg, 0, 0, e.width, e.height)
+    def _sync_list(self, w, h):
+        """列表画布尺寸同步（宽高均为像素，可来自事件或显式目标尺寸）。
+        背景与空状态即时跟随；宽度变化时卡片边框即时跟随（廉价），
+        文字重排防抖。顺带刷新折叠提示。"""
+        self.canvas.coords(self.list_bg, 0, 0, w, h)
         self._layout_empty()
-        if e.width != self._last_cw:
-            self._last_cw = e.width
-            cw = max(120, e.width - 2)
+        if w != self._last_cw:
+            self._last_cw = w
+            cw = max(120, w - 2)
             for item in self.item_widgets.values():
                 try:
                     item.set_frame_width(cw)
@@ -376,6 +494,10 @@ class TodoApp:
             if self._restack_job:
                 self.root.after_cancel(self._restack_job)
             self._restack_job = self.root.after(80, self._fire_restack)
+        self._update_hint(vh=h)
+
+    def _on_scroll_configure(self, e):
+        self._sync_list(e.width, e.height)
 
     def _fire_restack(self):
         self._restack_job = None
@@ -385,6 +507,13 @@ class TodoApp:
         """重排卡片：设置文字宽度 -> 量高 -> 堆叠 -> 滚动区域。"""
         w = self.canvas.winfo_width()
         if w <= 1:
+            # 画布尚未映射：定时重试直至拿到真实宽度。早期 restack
+            # 在映射前空跑返回后，宽度去重会让补偿重排不再触发，
+            # 卡片就此停留在未布局状态（文字按初始窄宽换行、
+            # 删除键留在 (0,24)）——必须自愈重试
+            if self._restack_job:
+                self.root.after_cancel(self._restack_job)
+            self._restack_job = self.root.after(60, self._fire_restack)
             return
         cw = max(120, w - 2)
         ordered_ids = self._ordered_ids()
@@ -397,6 +526,7 @@ class TodoApp:
                     pass  # 防抖期间被销毁的旧卡片
         self.root.update_idletasks()
         y = 0
+        self._item_top = {}
         for tid in ordered_ids:
             item = self.item_widgets.get(tid)
             win = self._item_wins.get(tid)
@@ -409,39 +539,10 @@ class TodoApp:
             item.layout(cw, h)
             self.canvas.itemconfig(win, width=cw, height=h)
             self.canvas.coords(win, 0, y)
+            self._item_top[tid] = y
             y += h + 8
         self.canvas.configure(scrollregion=(0, 0, w, max(y - 8, 1)))
-
-    def _raise_card(self, tid):
-        """把卡片置顶：整体重建该卡片的控件。
-        新创建的子窗口必然位于所有同级窗口之上（各平台铁律），
-        不依赖 Windows 对画布内嵌窗口的层级重排（实测不可靠）。"""
-        todo = next((t for t in self.todos if t["id"] == tid), None)
-        old = self.item_widgets.get(tid)
-        win = self._item_wins.get(tid)
-        if not todo or not old or win is None:
-            return win
-        try:
-            x, y = self.canvas.coords(win)
-            w = int(float(self.canvas.itemcget(win, "width")))
-            h = int(float(self.canvas.itemcget(win, "height")))
-        except Exception:
-            return win
-        try:
-            self.canvas.delete(win)
-            old.widget.destroy()
-            item = TodoItem(self, todo)  # 全新子窗口 = 原生最顶层
-            item.set_width(w)
-            item.layout(w, h)
-            self.item_widgets[tid] = item
-            new_win = self.canvas.create_window(
-                x, y, window=item.widget, anchor="nw",
-                width=w, height=h)
-            self._item_wins[tid] = new_win
-            self._bind_wheel(item.widget)
-            return new_win
-        except Exception:
-            return win
+        self._update_hint()
 
     def _make_proxy(self, item, w, h):
         """拖拽替身：极简子窗口快照（新建子窗口天然位于同级最顶层）。
@@ -527,13 +628,12 @@ class TodoApp:
 
     def _animate_restack(self, moved_tid=None):
         """勾选/取消勾选后：卡片滑动到新堆叠位置（沉底/回升）。
-        滑动中的卡片置顶，从其他卡片上方掠过。"""
+        纯坐标滑动，不重建任何控件——分层透明窗口下 HWND 销毁/创建
+        会触发整窗重新合成，是动画起步卡顿与结束后闪烁的根因。"""
         w = self.canvas.winfo_width()
         if w <= 1:
             self.render_items()
             return
-        if moved_tid is not None and moved_tid in self._item_wins:
-            self._raise_card(moved_tid)  # 滑动卡片单独位于最顶层
         order = self._ordered_ids()
         y = 0
         targets = {}
@@ -543,6 +643,7 @@ class TodoApp:
                 continue
             targets[tid] = y
             y += item.height + 8
+        self._item_top.update(targets)  # 动画终点即最终堆叠位置
         for tid, ty in targets.items():
             win = self._item_wins.get(tid)
             if win is None:
@@ -554,6 +655,7 @@ class TodoApp:
             if abs(cur - ty) >= 1:
                 self._glide_win(win, ty, ms=150)
         self.canvas.configure(scrollregion=(0, 0, w, max(y - 8, 1)))
+        self._update_hint()
 
     # ---------- 长按拖动排序 ----------
     def _begin_reorder(self, item):
@@ -676,37 +778,26 @@ class TodoApp:
         tid = item.todo["id"]
 
         def finish():
-            # 销毁替身（真身随 render_items 一并重建）
+            # 销毁替身（真身一直在屏外 -3000 处保留，完好无损）
             try:
                 self.canvas.delete(dragged_win)
                 r["proxy"].destroy()
             except Exception:
                 pass
-            # 写回顺序（seq 即视觉索引），保存并重排
+            # 写回顺序（seq 即视觉索引），保存并归位。
+            # 用 _restack 而非 render_items：卡片控件零销毁零重建，
+            # 避免松手瞬间整窗重建带来的闪烁与卡顿
             by_id = {t["id"]: t for t in self.todos}
             for i, t_id in enumerate(order):
                 if t_id in by_id:
                     by_id[t_id]["seq"] = i
             self._save_todos()
-            self.render_items()
+            self._restack()
 
         if tid in final:
             self._glide_win(dragged_win, final[tid], ms=120, done=finish)
         else:
             finish()
-
-    def _bind_wheel(self, widget):
-        widget.bind("<MouseWheel>", self._wheel)
-        widget.bind("<Button-4>", lambda e: self._wheel_dir(-1))
-        widget.bind("<Button-5>", lambda e: self._wheel_dir(1))
-        for child in widget.winfo_children():
-            self._bind_wheel(child)
-
-    def _wheel(self, e):
-        self._wheel_dir(-1 if e.delta > 0 else 1)
-
-    def _wheel_dir(self, d):
-        self.canvas.yview_scroll(d, "units")
 
     def _layout_empty(self):
         if self.todos:
@@ -725,6 +816,27 @@ class TodoApp:
         for it in self.empty_items:
             self.canvas.itemconfig(it, state="normal")
 
+    # ---------- 折叠提示（被窗口下沿裁掉的待办） ----------
+    def _update_hint(self, vh=None):
+        """有待办完全藏到可视区下沿之外时，底部条带中央显示一个小箭头。
+        纯展示不交互。vh 可显式传入列表可视高度（缩放拖拽中 winfo
+        尚未生效时用）。"""
+        try:
+            if self._collapsed or not self.todos:
+                self.chrome.itemconfig(self.hint_item, state="hidden")
+                return
+            if vh is None:
+                vh = self.canvas.winfo_height()
+            if vh <= 1:
+                return
+            bottom = self.canvas.canvasy(vh)
+            hidden = any(top >= bottom - 2
+                         for top in self._item_top.values())
+            self.chrome.itemconfig(self.hint_item,
+                                   state="normal" if hidden else "hidden")
+        except Exception:
+            pass
+
     # ---------- 栏位高度体系 ----------
     def _slot_h(self):
         """单个栏位高度 = 单行卡片高度 + 卡片间距。"""
@@ -741,12 +853,13 @@ class TodoApp:
         return HEADER_H + 8 + self._slots_height(slots) + 26
 
     def _set_slots(self, slots, save=True):
-        """以栏位为单位设置窗口高度（3~10 栏）。"""
+        """以栏位为单位设置窗口高度（3~10 栏），同步布局同帧画实。"""
         slots = min(max(int(slots), 3), 10)
         self.list_slots = slots
         if not self._collapsed:
             h = self._height_for_slots(slots)
-            self.root.geometry(f"{self.root.winfo_width()}x{h}")
+            if h != self.root.winfo_height():
+                self._apply_height(h)
         if save:
             self._schedule_save()
 
@@ -770,12 +883,13 @@ class TodoApp:
             self._collapsed = False
             self.root.minsize(MIN_W, MIN_H)
             h = self._height_for_slots(self.list_slots)
-            self.root.geometry(f"{self.root.winfo_width()}x{h}")
+            self._apply_height(h)  # 展开拉高：同步布局同帧画实
         else:
             self._collapsed = True
             self.root.minsize(MIN_W, HEADER_H + 1)
-            self.root.geometry(f"{self.root.winfo_width()}x{HEADER_H + 1}")
-        self._layout(force=True)
+            w = self.root.winfo_width()
+            self.root.geometry(f"{w}x{HEADER_H + 1}")
+            self._layout(force=True, size=(w, HEADER_H + 1))
         self._schedule_save()
 
     # ========== 设置弹窗（独立静态窗口，实现在 dialogs 模块） ==========
@@ -805,7 +919,6 @@ class TodoApp:
                                             anchor="nw")
             self.item_widgets[t["id"]] = item
             self._item_wins[t["id"]] = win
-            self._bind_wheel(item.widget)
             if t["id"] == self._flash_id:
                 item.flash()
         self._flash_id = None
@@ -823,7 +936,8 @@ class TodoApp:
         self._next_id += 1
         self._save_todos()
         self.render_items()
-        self.canvas.yview_moveto(1.0)
+        self.canvas.yview_moveto(0)  # 无滚轮交互：视图始终锚定顶部
+        self.root.after_idle(self._update_hint)
         self._auto_slots()
 
     def update_todo_text(self, todo_id, text):
@@ -1024,6 +1138,11 @@ class TodoApp:
         self.root.attributes("-topmost", on)
         if self.settings_win and self.settings_win.winfo_exists():
             self.settings_win.attributes("-topmost", on)
+        if self._guard:
+            if on:
+                self._guard.stop()    # 置顶模式天然免疫 Win+D
+            else:
+                self._guard.start()   # 非置顶：轮询防埋
         self._save_config()
 
     def _apply_autostart(self, on):
@@ -1195,9 +1314,16 @@ class TodoApp:
                 slots = min(max(slots, 3), 10)
                 self.list_slots = slots
                 h = self._height_for_slots(slots)
+        if (w, h) == self._last_layout_size:
+            return  # 栏位吸附后尺寸未变：跳过冗余的窗口重设与合成
         self.root.geometry(f"{w}x{h}")
-        # 每帧强制同步布局：内容紧跟窗口，消除空白闪烁
-        self.root.update_idletasks()
+        # 同步布局（关键修复）：直接按目标尺寸重排画布元素并立即重绘，
+        # 不等 <Configure> 事件绕事件队列一圈。否则拉伸时新露出的区域
+        # 会先被系统按色键擦除——而色键是全透明的，表现为一串“内容消失”
+        # 的破洞，下一帧才填回（拉伸闪烁的根因；缩短没有新增暴露区，
+        # 所以一直很流畅）。
+        self._layout(force=True, size=(w, h))
+        self._flush_paints()
         self._schedule_save()
 
     def _edge_release(self, _e):
@@ -1205,6 +1331,8 @@ class TodoApp:
 
     # ========== 退出 ==========
     def _quit(self):
+        if self._guard:
+            self._guard.stop()
         self._cancel_jobs()
         self._save_config()
         storage.save_json(storage.DATA_FILE, self.todos)

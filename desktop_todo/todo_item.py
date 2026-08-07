@@ -9,7 +9,8 @@ from .utils import clickable, ink_dy
 class TodoItem:
     PAD = 12          # 卡片上下内边距
     LEFT = 14         # 勾选框左边距
-    DEL_RESERVE = 30  # 删除键预留宽度
+    DEL_RESERVE = 30  # 删除键预留宽度（兜底值，实际按字形实测）
+    EDIT_GAP = 18     # 行内编辑框与删除键之间的额外净空
 
     def __init__(self, app, todo):
         self.app = app
@@ -83,6 +84,25 @@ class TodoItem:
             outline=(th["border"] if pct >= 96 else ""))
 
     # ---------- 尺寸 ----------
+    def _del_glyph_w(self):
+        """删除键 ✕ 的实际字形宽度（高 DPI / 大字号下远超字号的兜底估算）。
+        隐藏状态下 bbox 不可用，先临时置为可见同步测量再恢复——
+        全程在同一事件处理内完成，不会触发中间帧重绘。"""
+        c = self.widget
+        hidden = c.itemcget(self.del_item, "state") == "hidden"
+        if hidden:
+            c.itemconfig(self.del_item, state="normal")
+        bbox = c.bbox(self.del_item)
+        if hidden:
+            c.itemconfig(self.del_item, state="hidden")
+        if bbox:
+            return bbox[2] - bbox[0]
+        return self.DEL_RESERVE - 14  # 兜底：退回字号估算
+
+    def _text_reserve(self):
+        """文字 / 编辑框右侧应让出的总宽度：✕ 右缘边距 + 字形宽 + 间隔。"""
+        return 16 + self._del_glyph_w() + 8
+
     def set_frame_width(self, cw):
         """廉价宽度过渡：只动边框与删除键位置，文字暂不重排（拖拽中）。"""
         self.widget.coords(self.rect, 0, 0, cw, self.height)
@@ -91,7 +111,8 @@ class TodoItem:
     def set_width(self, cw):
         self.width = cw
         self.widget.itemconfig(self.text_item,
-                               width=cw - self.text_left - self.DEL_RESERVE)
+                               width=cw - self.text_left
+                               - self._text_reserve())
 
     def measure(self):
         bbox = self.widget.bbox(self.text_item)
@@ -237,13 +258,17 @@ class TodoItem:
         th = self.app.theme
         self.widget.itemconfig(self.text_item, state="hidden")
         entry = tk.Entry(self.widget, font=self.font_normal, relief="flat",
-                         bd=0, bg=th["hover"], fg=th["fg"],
-                         insertbackground=th["fg"])
+                         bd=0, highlightthickness=0, bg=th["hover"],
+                         fg=th["fg"], insertbackground=th["fg"])
         entry.insert(0, self.todo["text"])
         entry.select_range(0, "end")
+        cw = getattr(self, "width", 240)
+        # 编辑框右缘 = ✕ 左缘再让 EDIT_GAP：按字形实测宽度动态缩短，
+        # 高 DPI / 大字号下 ✕ 很宽，固定预留会被挡住
         self._edit_win = self.widget.create_window(
             self.text_left, self.height / 2, window=entry, anchor="w",
-            width=self.width - self.text_left - self.DEL_RESERVE)
+            width=max(60, cw - self.text_left - self._text_reserve()
+                      - self.EDIT_GAP))
         entry.focus_set()
         entry.bind("<Return>", lambda e: self._commit_edit())
         entry.bind("<Escape>", lambda e: self._cancel_edit())

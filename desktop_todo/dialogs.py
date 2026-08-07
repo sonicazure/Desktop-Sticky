@@ -111,7 +111,7 @@ def open_settings(app):
     # 左侧标签列：按最长标签的实际像素宽度取值（不用字符单位——
     # 字符单位随字体不同忽大忽小，是宽度失控的根源）
     label_px = app.font(app.font_family, app.font_size).measure(
-        "开机自动启动") + 8
+        "开机自启") + 8
     line_h = app.font(app.font_family, app.font_size).metrics("linespace")
     sw_dy = ink_dy(app.font_size)  # 绘制类控件下偏量，对齐文字油墨中线
     # 定宽标签列的显式高度：取 pill 行高（linespace+10，全档位实测
@@ -174,7 +174,7 @@ def open_settings(app):
                         bg=th["hover"], fg=th["fg"], padx=10, pady=3,
                         font=(app.font_family, app.font_size))
     clickable(font_btn)
-    font_btn.pack(side="right")
+    font_btn.pack(side="right", padx=(0, 2))
     font_btn.bind("<Button-1>",
                   lambda e: app._open_font_picker(font_btn))
 
@@ -207,7 +207,7 @@ def open_settings(app):
     Switch(rc, on=app.topmost, command=app._apply_topmost,
            accent=th["accent"], bg=th["panel"]).pack(side="right",
                                                      pady=(sw_dy, 0))
-    r, rc = row("开机自动启动")
+    r, rc = row("开机自启")
     Switch(rc, on=get_autostart(), command=app._apply_autostart,
            accent=th["accent"], bg=th["panel"]).pack(side="right",
                                                      pady=(sw_dy, 0))

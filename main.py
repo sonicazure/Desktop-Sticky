@@ -23,6 +23,7 @@ To-Do List 桌面小组件 v7（模块化重构版）
     desktop_todo/widgets.py     自定义控件（矩形滑块开关 Switch）
     desktop_todo/todo_item.py   单条待办卡片
     desktop_todo/dialogs.py     弹窗（新建待办 / 设置 / 字体选择）
+    desktop_todo/dockguard.py   桌面防埋守卫（非置顶时防 Win+D 压盖）
     desktop_todo/app.py         主程序 TodoApp
     main.py                     程序入口
 """
