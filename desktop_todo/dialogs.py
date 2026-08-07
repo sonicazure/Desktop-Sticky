@@ -200,16 +200,19 @@ def open_settings(app):
     r, rc = row("加粗")
     Switch(rc, on=app.font_bold, command=app._apply_bold,
            accent=th["accent"], bg=th["panel"]).pack(side="right",
+                                                     padx=(0, 2),
                                                      pady=(sw_dy, 0))
 
     group("高级")
     r, rc = row("窗口置顶")
     Switch(rc, on=app.topmost, command=app._apply_topmost,
            accent=th["accent"], bg=th["panel"]).pack(side="right",
+                                                     padx=(0, 2),
                                                      pady=(sw_dy, 0))
     r, rc = row("开机自启")
     Switch(rc, on=get_autostart(), command=app._apply_autostart,
            accent=th["accent"], bg=th["panel"]).pack(side="right",
+                                                     padx=(0, 2),
                                                      pady=(sw_dy, 0))
     r, rc = row("清理")
     app.clear_btn = tk.Label(rc, text="清除已完成事项", bg=th["panel"],
