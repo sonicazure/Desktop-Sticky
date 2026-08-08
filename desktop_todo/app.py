@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """主程序：无边框桌面待办小组件。
 
-- 标题栏拖动移动，右 / 下 / 右下角贴边缩放（拖拽时每帧同步布局）
+- 标题栏拖动移动，左 / 右 / 下 / 右下角贴边缩放（拖拽时每帧同步布局）
 - 透明度 0–100% 滑杆（有序抖动点阵）：底板与卡片底色淡出，文字实心
 - 双主题、行内编辑、删除/清除可撤销、双击标题栏折叠
 """
@@ -13,9 +13,9 @@ from tkinter import font as tkfont
 
 from . import dialogs, dockguard, storage
 from .autostart import entry_script, get_autostart_value, set_autostart
-from .constants import (_BAYER8, CURSOR_NS, CURSOR_NWSE, CURSOR_WE, EDGE,
-                        HEADER_H, KEY, MIN_H, MIN_W, SIZE_CHOICES, THEMES,
-                        TITLE_FONT)
+from .constants import (_BAYER8, CARD_W, CURSOR_NS, CURSOR_NWSE, CURSOR_WE,
+                        EDGE, HEADER_H, KEY, MIN_H, MIN_W, SIZE_CHOICES,
+                        THEMES, TITLE_FONT)
 from .todo_item import TodoItem
 from .utils import clickable, enable_dpi_awareness
 
@@ -98,7 +98,7 @@ class TodoApp:
         # 待办栏位：初始 3 栏，随待办数自动增减，手动调整以栏为单位
         n = len(self.todos)
         self.list_slots = int(self.config.get(
-            "list_slots", min(max(n, 3), 10)))
+            "list_slots", min(max(n, 3), 20)))
 
         self._build_ui()
         self._set_slots(self.list_slots, save=False)
@@ -322,8 +322,10 @@ class TodoApp:
         self.sep_line = self.chrome.create_line(0, HEADER_H, 1, HEADER_H)
 
         cy = HEADER_H / 2
+        # 标题左缘与待办勾选圆点左缘垂直对齐：
+        # 列表左边距 14 + 卡片内圆点左边距 LEFT 14 + 圆环内缩 2.2 ≈ 30
         self.title_item = self.chrome.create_text(
-            18, cy, text="To-Do List", anchor="w",
+            30, cy, text="To-Do List", anchor="w",
             font=TITLE_FONT, fill=th["header_fg"])
         for name in ("close", "settings", "plus"):
             self._make_icon(name)
@@ -489,8 +491,10 @@ class TodoApp:
                     item.set_frame_width(cw)
                 except Exception:
                     pass  # 防抖期间被销毁的旧卡片
-            for win in self._item_wins.values():
-                self.canvas.itemconfig(win, width=cw)
+            # 注意：这里刻意不动卡片嵌入窗口的宽度（固定 CARD_W 超宽，
+            # 由画布裁剪出右缘）。逐帧缩放 N 个卡片原生窗口会触发
+            # Windows 按色键整窗擦除再重绘，正是水平缩放频闪的根因；
+            # set_frame_width 只动画布内的矩形/删除键坐标，开销极低
             if self._restack_job:
                 self.root.after_cancel(self._restack_job)
             self._restack_job = self.root.after(80, self._fire_restack)
@@ -537,7 +541,9 @@ class TodoApp:
             except Exception:
                 continue
             item.layout(cw, h)
-            self.canvas.itemconfig(win, width=cw, height=h)
+            # 只同步高度：宽度在创建时已固定为 CARD_W（超宽裁剪），
+            # 缩放卡片原生窗口会触发整窗透明擦除+重绘，是频闪根因
+            self.canvas.itemconfig(win, height=h)
             self.canvas.coords(win, 0, y)
             self._item_top[tid] = y
             y += h + 8
@@ -667,7 +673,9 @@ class TodoApp:
             return
         try:
             x, y = self.canvas.coords(real_win)
-            w = int(float(self.canvas.itemcget(real_win, "width")))
+            # 嵌入窗口宽度已固定为 CARD_W（超宽裁剪），替身的视觉宽度
+            # 取卡片当前的布局宽度 item.width，由 set_width 维护
+            w = getattr(item, "width", None) or 300
             h = int(float(self.canvas.itemcget(real_win, "height")))
         except Exception:
             return
@@ -854,7 +862,7 @@ class TodoApp:
 
     def _set_slots(self, slots, save=True):
         """以栏位为单位设置窗口高度（3~10 栏），同步布局同帧画实。"""
-        slots = min(max(int(slots), 3), 10)
+        slots = min(max(int(slots), 3), 20)
         self.list_slots = slots
         if not self._collapsed:
             h = self._height_for_slots(slots)
@@ -864,8 +872,8 @@ class TodoApp:
             self._schedule_save()
 
     def _auto_slots(self):
-        """待办数变化时：栏位自动跟随（3 起步，10 封顶）。"""
-        self._set_slots(min(max(len(self.todos), 3), 10))
+        """待办数变化时：栏位自动跟随（3 起步，20 封顶）。"""
+        self._set_slots(min(max(len(self.todos), 3), 20))
 
     # ---------- 新建待办 / 设置 / 折叠 ----------
     def _open_add_dialog(self):
@@ -915,8 +923,10 @@ class TodoApp:
             item = TodoItem(self, t)
             # 先在屏外创建：restack 中途的重绘不会把未归位的卡片
             # 画在标题下方（添加/删除时第一条虚影的根因）
+            # 宽度固定为 CARD_W 超宽，右缘由列表画布裁剪：水平缩放期间
+            # 卡片原生窗口不需要任何尺寸变更，根除逐帧透明擦除频闪
             win = self.canvas.create_window(-3000, 0, window=item.widget,
-                                            anchor="nw")
+                                            anchor="nw", width=CARD_W)
             self.item_widgets[t["id"]] = item
             self._item_wins[t["id"]] = win
             if t["id"] == self._flash_id:
@@ -1196,7 +1206,7 @@ class TodoApp:
             cursor = CURSOR_NWSE
         else:
             mode = self._edge_mode(e)
-            cursor = {"r": CURSOR_WE, "b": CURSOR_NS,
+            cursor = {"r": CURSOR_WE, "l": CURSOR_WE, "b": CURSOR_NS,
                       "br": CURSOR_NWSE}.get(mode, "")
         if cursor != self._last_cursor:
             self._last_cursor = cursor
@@ -1246,12 +1256,15 @@ class TodoApp:
         w, h = self.root.winfo_width(), self.root.winfo_height()
         if x < 0 or y < 0 or x > w or y > h:
             return None
+        near_l = x <= EDGE
         near_r = x >= w - EDGE
         near_b = y >= h - EDGE
         if near_r and near_b:
             return "br"
         if near_r:
             return "r"
+        if near_l:
+            return "l"
         if near_b:
             return "b"
         return None
@@ -1263,7 +1276,7 @@ class TodoApp:
                                       "Spinbox", "TCombobox"):
             return
         mode = self._edge_mode(e)
-        cursor = ({"r": CURSOR_WE, "b": CURSOR_NS, "br": CURSOR_NWSE}[mode]
+        cursor = ({"r": CURSOR_WE, "l": CURSOR_WE, "b": CURSOR_NS, "br": CURSOR_NWSE}[mode]
                   if mode else
                   ("hand2" if getattr(e.widget, "_is_clickable", False) else ""))
         key = (e.widget, cursor)
@@ -1292,6 +1305,8 @@ class TodoApp:
         self._rx, self._ry = e.x_root, e.y_root
         self._rw = self.root.winfo_width()
         self._rh = self.root.winfo_height()
+        self._wx = self.root.winfo_x()
+        self._wy = self.root.winfo_y()
 
     def _edge_drag(self, e):
         if self._resize_mode and not self._dragging:
@@ -1300,6 +1315,8 @@ class TodoApp:
     def _do_resize(self, e):
         dx, dy = e.x_root - self._rx, e.y_root - self._ry
         w, h = self._rw, self._rh
+        if "l" in self._resize_mode:
+            w = max(MIN_W, self._rw - dx)
         if "r" in self._resize_mode:
             w = max(MIN_W, self._rw + dx)
         if "b" in self._resize_mode:
@@ -1311,12 +1328,16 @@ class TodoApp:
                 slots = int(round((avail + 8) / self._slot_h()))
                 if len(self.todos) < 4:
                     slots = 3  # 少于 4 条待办时高度固定为 3 栏
-                slots = min(max(slots, 3), 10)
+                slots = min(max(slots, 3), 20)
                 self.list_slots = slots
                 h = self._height_for_slots(slots)
         if (w, h) == self._last_layout_size:
             return  # 栏位吸附后尺寸未变：跳过冗余的窗口重设与合成
-        self.root.geometry(f"{w}x{h}")
+        if "l" in self._resize_mode:
+            self.root.geometry(
+                f"{w}x{h}+{self._wx + (self._rw - w)}+{self._wy}")
+        else:
+            self.root.geometry(f"{w}x{h}")
         # 同步布局（关键修复）：直接按目标尺寸重排画布元素并立即重绘，
         # 不等 <Configure> 事件绕事件队列一圈。否则拉伸时新露出的区域
         # 会先被系统按色键擦除——而色键是全透明的，表现为一串“内容消失”

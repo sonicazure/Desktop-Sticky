@@ -2,7 +2,7 @@
 """单条待办卡片：画布直绘（底色可透明、文字实心、悬停浮现删除键）。"""
 import tkinter as tk
 
-from .constants import KEY
+from .constants import CARD_W, KEY
 from .utils import clickable, ink_dy
 
 
@@ -36,11 +36,17 @@ class TodoItem:
         self._stip_dense = app._stipple_for(72)
         self._check_hover = False
         self._chk_ring = None
+        self._glyph_w = None  # ✕ 字形宽度缓存（实例生命周期内字体不变）
 
+        # 画布底色必须是色键：卡片矩形的透明点阵（透明度滑杆）要透过
+        # 它看到桌面。嵌入窗口为 CARD_W 固定超宽、右缘由父画布裁剪，
+        # 矩形未覆盖的右侧细条由 strip 补条按列表背景同款填充+点阵
+        # 补足——否则那里会露出一条透出桌面的虚线竖缝
         c = tk.Canvas(app.canvas, bg=KEY, highlightthickness=0, bd=0,
                       height=self.height)
         clickable(c)
         self.widget = c
+        self.strip = c.create_rectangle(0, 0, 0, 0, width=0)
         self.rect = c.create_rectangle(0, 0, 10, 10, width=1)
         # 勾选圆圈直接画在卡片画布上，不用子控件——任何透明度下都无痕
         # （点击由整卡 press/release 统一处理，圆圈仅保留悬停变色）
@@ -82,12 +88,19 @@ class TodoItem:
         self.widget.itemconfig(
             self.rect, fill=fill, stipple=stip,
             outline=(th["border"] if pct >= 96 else ""))
+        # 右侧补条与列表背景完全同款（app.py 中 list_bg 的逻辑）：
+        # 透明度变化时补条与背景同步淡出，观感无缝
+        self.widget.itemconfig(
+            self.strip, fill=(KEY if pct < 4 else th["bg"]), stipple=stip)
 
     # ---------- 尺寸 ----------
     def _del_glyph_w(self):
         """删除键 ✕ 的实际字形宽度（高 DPI / 大字号下远超字号的兜底估算）。
         隐藏状态下 bbox 不可用，先临时置为可见同步测量再恢复——
-        全程在同一事件处理内完成，不会触发中间帧重绘。"""
+        全程在同一事件处理内完成，不会触发中间帧重绘。
+        结果缓存：拖拽中每帧都会用到，而字体在实例生命周期内不变。"""
+        if self._glyph_w is not None:
+            return self._glyph_w
         c = self.widget
         hidden = c.itemcget(self.del_item, "state") == "hidden"
         if hidden:
@@ -96,17 +109,25 @@ class TodoItem:
         if hidden:
             c.itemconfig(self.del_item, state="hidden")
         if bbox:
-            return bbox[2] - bbox[0]
-        return self.DEL_RESERVE - 14  # 兜底：退回字号估算
+            self._glyph_w = bbox[2] - bbox[0]
+        else:
+            self._glyph_w = self.DEL_RESERVE - 14  # 兜底：退回字号估算
+        return self._glyph_w
 
     def _text_reserve(self):
         """文字 / 编辑框右侧应让出的总宽度：✕ 右缘边距 + 字形宽 + 间隔。"""
         return 16 + self._del_glyph_w() + 8
 
     def set_frame_width(self, cw):
-        """廉价宽度过渡：只动边框与删除键位置，文字暂不重排（拖拽中）。"""
+        """宽度过渡（拖拽中逐帧调用）：边框、右侧补条、删除键即时跟随，
+        文字换行也实时跟随——否则缩窄时文字会溢出卡片右缘外，直到
+        80ms 防抖 restack 才收回，表现为"不跟光标、乱跳"（旧的逐帧
+        HWND 缩放靠窗口裁剪遮住了这种溢出）。高度重测仍留给防抖
+        restack，避免逐帧量高开销。"""
         self.widget.coords(self.rect, 0, 0, cw, self.height)
+        self.widget.coords(self.strip, cw, 0, CARD_W, self.height)
         self.widget.coords(self.del_item, cw - 16, self.height / 2)
+        self.set_width(cw)
 
     def set_width(self, cw):
         self.width = cw
@@ -123,6 +144,7 @@ class TodoItem:
         self.height = h
         mid = h / 2
         self.widget.coords(self.rect, 0, 0, cw, h)
+        self.widget.coords(self.strip, cw, 0, CARD_W, h)
         self.widget.coords(self.text_item, self.text_left, mid)
         self.widget.coords(self.del_item, cw - 16, mid)
         self.widget.config(height=h)

@@ -5,7 +5,9 @@ import sys
 APP_NAME = "DesktopTodoWidget"
 MIN_W, MIN_H = 280, 240
 HEADER_H = 64
-EDGE = 6            # 边缘缩放感应宽度（像素）
+EDGE = 12            # 边缘缩放感应宽度（像素）
+CARD_W = 3200        # 卡片嵌入窗口的固定超宽宽度：超出部分由列表画布裁剪，
+                     # 水平缩放时卡片原生窗口零尺寸变更（避免逐帧透明擦除频闪）
 KEY = "#808080"     # 色键：该颜色像素完全透明（文字与图标不使用此色）
 TITLE_FONT = ("Times New Roman", 15, "bold")   # 标题锁定字体，不随设置更改
 
