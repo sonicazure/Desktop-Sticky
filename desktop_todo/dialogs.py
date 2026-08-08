@@ -262,25 +262,21 @@ def open_font_picker(app, anchor):
     th = app.theme
     win = tk.Toplevel(app.root)
     app._font_picker = win
+    win.withdraw()   # ← 新增：先隐藏，属性配置完再显示
+    win.transient(app.settings_win or app.root)   # ← 新增：浮在设置页之上
     win.overrideredirect(True)
     win.configure(bg=th["border"])
     if app.topmost:
         win.attributes("-topmost", True)
     body = tk.Frame(win, bg=th["panel"], highlightthickness=0, bd=0)
     body.pack(padx=1, pady=1)
-    sb = tk.Scrollbar(body, orient="vertical", bg=th["hover"],
-                      troughcolor=th["panel"], bd=0,
-                      highlightthickness=0, width=10,
-                      activebackground=th["accent"])
     lb = tk.Listbox(
         body, height=12, width=22,
         font=(app.font_family, app.font_size),
         bg=th["panel"], fg=th["fg"],
         selectbackground=th["accent"], selectforeground="#FFFFFF",
         relief="flat", highlightthickness=0, bd=0,
-        activestyle="none", exportselection=False,
-        yscrollcommand=sb.set)
-    sb.config(command=lb.yview)
+        activestyle="none", exportselection=False)
     for f in app.font_families:
         lb.insert("end", f)
     try:
@@ -291,7 +287,6 @@ def open_font_picker(app, anchor):
     lb.activate(idx)
     lb.see(max(0, idx - 3))
     lb.pack(side="left", fill="both")
-    sb.pack(side="right", fill="y")
     lb.bind("<MouseWheel>",
             lambda e: lb.yview_scroll(-1 if e.delta > 0 else 1, "units"))
     lb.bind("<Button-4>", lambda e: lb.yview_scroll(-1, "units"))
@@ -315,11 +310,54 @@ def open_font_picker(app, anchor):
     win.bind("<FocusOut>", lambda e: win.after(
         150, lambda: close_picker_if_unfocused(app, win)))
     win.update_idletasks()
-    x = anchor.winfo_rootx()
-    y = anchor.winfo_rooty() + anchor.winfo_height() + 4
-    x = min(max(0, x), win.winfo_screenwidth() - win.winfo_width() - 8)
-    y = min(max(0, y), win.winfo_screenheight() - win.winfo_height() - 8)
-    win.geometry(f"+{x}+{y}")
+
+    def follow(_e=None):
+        """按字体按钮的屏幕坐标重新定位下拉（初始显示与跟随共用）。
+        拖设置页标题栏时 Windows 会把设置页抬到最前、反超下拉，
+        需要把下拉抬回——但 lift 会反过来触发设置页的 Configure，
+        无守卫调用会形成 Configure↔lift 无限事件风暴（窗口卡死），
+        所以几何与抬升都先判"确实需要"才执行。"""
+        try:
+            if not (win.winfo_exists() and anchor.winfo_exists()):
+                return
+            x = anchor.winfo_rootx()
+            y = anchor.winfo_rooty() + anchor.winfo_height() + 4
+            x = min(max(0, x), win.winfo_screenwidth()
+                    - win.winfo_width() - 8)
+            y = min(max(0, y), win.winfo_screenheight()
+                    - win.winfo_height() - 8)
+            if (x, y) != getattr(follow, "_last", None):
+                follow._last = (x, y)
+                win.geometry(f"+{x}+{y}")
+            sw = app.settings_win
+            if (sw and sw.winfo_exists() and win.winfo_ismapped()
+                    and win.tk.eval(
+                        f"wm stackorder {win} isabove {sw}") == "0"):
+                win.lift(sw)  # 仅当下拉真的被反超时才抬升，打破事件环
+        except Exception:
+            pass
+
+    follow()
+    win.deiconify()
+    win.lift(app.settings_win)
+    # 设置窗口被真正拖动时关闭下拉（与系统下拉菜单行为一致）。
+    # 必须按"位置是否变化"判定：打开时的 lift/deiconify 会异步触发
+    # 设置页的 Configure，事件送达时绑定已生效——不设防会把刚打开
+    # 的下拉误杀；lift 引起的伪 Configure 位置没变，直接忽略
+    if app.settings_win:
+        sw = app.settings_win
+        origin = (sw.winfo_x(), sw.winfo_y())
+
+        def close_on_move(_e=None):
+            try:
+                if not win.winfo_exists():
+                    return
+                if (sw.winfo_x(), sw.winfo_y()) != origin:
+                    win.destroy()
+            except Exception:
+                pass
+
+        sw.bind("<Configure>", close_on_move)
     lb.focus_set()
 
 

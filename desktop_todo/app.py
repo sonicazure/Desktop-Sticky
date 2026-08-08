@@ -322,10 +322,14 @@ class TodoApp:
         self.sep_line = self.chrome.create_line(0, HEADER_H, 1, HEADER_H)
 
         cy = HEADER_H / 2
-        # 标题左缘与待办勾选圆点左缘垂直对齐：
-        # 列表左边距 14 + 卡片内圆点左边距 LEFT 14 + 圆环内缩 2.2 ≈ 30
+        # 标题 "T" 的纵向中心线与待办圆点的纵向中心线对齐：
+        # 圆点中心线 = 列表边距 14 + 卡片内边距 LEFT + 圆点直径/2；
+        # 标题锚点在文字左缘，向左退半个 "T" 的字形宽度即为中心对齐
+        check_size = max(16, int(round((self.font_size + 10) * 0.75)))
+        dot_cx = 14 + TodoItem.LEFT + check_size / 2
+        t_half = self.font(*TITLE_FONT).measure("T") / 2
         self.title_item = self.chrome.create_text(
-            30, cy, text="To-Do List", anchor="w",
+            dot_cx - t_half, cy, text="To-Do List", anchor="w",
             font=TITLE_FONT, fill=th["header_fg"])
         for name in ("close", "settings", "plus"):
             self._make_icon(name)
