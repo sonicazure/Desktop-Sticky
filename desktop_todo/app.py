@@ -14,8 +14,8 @@ from tkinter import font as tkfont
 from . import dialogs, dockguard, storage
 from .autostart import entry_script, get_autostart_value, set_autostart
 from .constants import (_BAYER8, CARD_W, CURSOR_NS, CURSOR_NWSE, CURSOR_WE,
-                        EDGE, HEADER_H, KEY, MIN_H, MIN_W, SIZE_CHOICES,
-                        THEMES, TITLE_FONT)
+                        EDGE, HEADER_H, KEY, MIN_H, MIN_W, PARK_X,
+                        SIZE_CHOICES, THEMES, TITLE_FONT)
 from .todo_item import TodoItem
 from .utils import clickable, enable_dpi_awareness
 
@@ -683,7 +683,7 @@ class TodoApp:
             h = int(float(self.canvas.itemcget(real_win, "height")))
         except Exception:
             return
-        self.canvas.coords(real_win, -3000, 0)  # 真身原地保留，移出视野
+        self.canvas.coords(real_win, PARK_X, 0)  # 真身原地保留，移出视野
         proxy = self._make_proxy(item, w, h)
         win = self.canvas.create_window(x, y, window=proxy, anchor="nw",
                                         width=w, height=h)
@@ -790,7 +790,7 @@ class TodoApp:
         tid = item.todo["id"]
 
         def finish():
-            # 销毁替身（真身一直在屏外 -3000 处保留，完好无损）
+            # 销毁替身（真身一直在屏外 PARK_X 处保留，完好无损）
             try:
                 self.canvas.delete(dragged_win)
                 r["proxy"].destroy()
@@ -929,7 +929,7 @@ class TodoApp:
             # 画在标题下方（添加/删除时第一条虚影的根因）
             # 宽度固定为 CARD_W 超宽，右缘由列表画布裁剪：水平缩放期间
             # 卡片原生窗口不需要任何尺寸变更，根除逐帧透明擦除频闪
-            win = self.canvas.create_window(-3000, 0, window=item.widget,
+            win = self.canvas.create_window(PARK_X, 0, window=item.widget,
                                             anchor="nw", width=CARD_W)
             self.item_widgets[t["id"]] = item
             self._item_wins[t["id"]] = win
