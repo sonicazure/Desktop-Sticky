@@ -34,6 +34,25 @@ _GA_ROOT = 2
 _DESKTOP_CLASSES = ("Progman", "WorkerW")
 _HWND_TOPMOST = -1
 _HWND_NOTOPMOST = -2
+_HWND_BOTTOM = 1
+
+
+def pin_to_bottom(tk_widget):
+    """把窗口压到 Z 序最底（桌面层之上、所有普通窗口之下）。
+
+    用于「不置顶 = 置底」模式：NOACTIVATE 不抢焦点，立即生效，
+    之后打开的窗口天然压在它上方。非 Windows 平台静默返回 False。
+    """
+    if not IS_WIN:
+        return False
+    try:
+        h = _u.GetAncestor(tk_widget.winfo_id(), _GA_ROOT)
+        if not h:
+            return False
+        return bool(_u.SetWindowPos(h, wintypes.HWND(_HWND_BOTTOM),
+                                    0, 0, 0, 0, _SWP_FLAGS))
+    except Exception:
+        return False
 
 
 class DesktopGuard:
