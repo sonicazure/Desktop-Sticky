@@ -49,6 +49,7 @@ class TodoApp:
         self._flash_id = None
         self._clear_armed = False
         self._collapsed = False
+        self._need_autofit = False  # 重建后首个成功 restack 时按内容实测高度补栏位
         self._last_collapse = 0.0
         self._stipples = {}
         self._font_cache = {}
@@ -387,6 +388,9 @@ class TodoApp:
         # 防止卡片停留在未布局状态（切字号/主题后待办消失的根因之一）
         self.canvas.yview_moveto(0)
         self.root.after_idle(self._fire_restack)
+        # 启动/重建后卡片高度要等首个成功 restack 才实测出来，
+        # 置标记让 _restack 收尾时按多行卡片实际高度补足栏位
+        self._need_autofit = True
 
     # ---------- 矢量图标 ----------
     def _make_icon(self, name):
@@ -560,6 +564,13 @@ class TodoApp:
             y += h + 8
         self.canvas.configure(scrollregion=(0, 0, w, max(y - 8, 1)))
         self._update_hint()
+        if self._need_autofit:
+            # 重建后卡片高度此处才实测完毕（画布未映射时 restack 会空跑重试）。
+            # 只增不减：多行卡片撑不下时自动补栏位，不动用户手动拖出的高度
+            self._need_autofit = False
+            need = self._content_slots()
+            if need > self.list_slots:
+                self._set_slots(need)
 
     def _make_proxy(self, item, w, h):
         """拖拽替身：极简子窗口快照（新建子窗口天然位于同级最顶层）。
@@ -882,9 +893,25 @@ class TodoApp:
         if save:
             self._schedule_save()
 
+    def _content_slots(self):
+        """完整容纳所有待办【实测高度】所需的栏位数。
+
+        多行卡片高度远超单栏：按 restack 实测的 item.height 累加折算，
+        否则窗口高度按条数估算，长文卡片会被下沿裁掉只露出首行。
+        """
+        hs = [self.item_widgets[tid].height
+              for tid in self._ordered_ids() if tid in self.item_widgets]
+        if not hs:
+            return 3
+        slot = self._slot_h()
+        total = sum(hs) + 8 * (len(hs) - 1)
+        # slots*slot - 8 >= total 的最小整数栏位（整数向上取整）
+        return min(20, max(3, (total + 8 + slot - 1) // slot))
+
     def _auto_slots(self):
-        """待办数变化时：栏位自动跟随（3 起步，20 封顶）。"""
-        self._set_slots(min(max(len(self.todos), 3), 20))
+        """待办数/内容高度变化时：栏位自动跟随（3 起步，20 封顶）。"""
+        self._set_slots(max(min(max(len(self.todos), 3), 20),
+                            self._content_slots()))
 
     # ---------- 新建待办 / 设置 / 折叠 ----------
     def _open_add_dialog(self):
@@ -967,6 +994,7 @@ class TodoApp:
                 t["text"] = text
         self._save_todos()
         self.render_items()
+        self._auto_slots()  # 文本变长换行增多时，自动补栏位完整显示
 
     def toggle_todo(self, todo_id, done):
         for t in self.todos:
@@ -1364,8 +1392,10 @@ class TodoApp:
                 # 纵向缩放以栏位为单位吸附：每次增减都是完整的待办栏
                 avail = self._rh + dy - HEADER_H - 8 - 26
                 slots = int(round((avail + 8) / self._slot_h()))
-                if len(self.todos) < 4:
-                    slots = 3  # 少于 4 条待办时高度固定为 3 栏
+                # 下限 = 内容实测高度折算的栏位：多行卡片必须完整显示
+                # （旧逻辑按条数锁 3 栏，少于 4 条时拖不动高度，
+                #   长文多行卡片永远被裁得只剩首行）
+                slots = max(slots, self._content_slots())
                 slots = min(max(slots, 3), 20)
                 self.list_slots = slots
                 h = self._height_for_slots(slots)
