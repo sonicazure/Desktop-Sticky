@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """桌面层级守卫（仅 Windows）：不置顶（置底）模式下维持
-「桌面之上、应用窗口之下」的精确层级。
+「桌面之上、应用窗口之下」的精确层级，并免疫 Win+D「显示桌面」。
 
 原理：
 - 置底不是 SetWindowPos(HWND_BOTTOM) 一刀切——它可能把窗口压到
@@ -8,13 +8,15 @@
   正确做法是找到桌面图标层所在窗口（Progman，或 Win+D / 壁纸引擎时
   承载 SHELLDLL_DefView 的 WorkerW），把组件插到它的【正上方】：
   桌面层之上、所有普通窗口之下。
-- Win+D「显示桌面」会把桌面层抬到普通窗口层最顶，把组件压在下面；
-  轮询发现中心点被桌面层占据时，把组件重新插回该桌面层正上方——
-  只浮出桌面、绝不越过任何应用窗口（旧的 TOPMOST→NOTOPMOST 弹跳
-  会把组件抬到普通层最顶，一旦桌面层状态瞬时误判，组件就跳到其他
-  窗口上面遮挡内容，且无法自行回落——层级乱跳的根因）。
-- 桌面还原后桌面层自己掉回最底，组件自然落回「桌面之上、应用之下」，
-  无需额外修正。
+- Win+D「显示桌面」会把桌面层抬到普通窗口层最顶。此时插在普通层
+  任何位置都会被桌面层压盖（系统维持桌面层在普通层最上），唯一
+  可靠的逃生通道是 TOPMOST 带——此刻应用窗口本就全部不可见，
+  短暂置顶不算遮挡。
+- 逃逸后进入「已逃逸」状态：轮询检测桌面层是否已落回（其上方
+  不再有非置顶窗口 = 显示桌面结束），一旦结束就把组件重新插回
+  桌面图标层正上方——落回「桌面之上、应用之下」，全程绝不会
+  停留在应用窗口之上（旧的 TOPMOST→NOTOPMOST 弹跳会把组件留在
+  普通层最顶遮挡其他窗口，是层级乱跳的根因）。
 """
 import ctypes
 import sys
@@ -34,6 +36,10 @@ if IS_WIN:
     _u.GetAncestor.restype = wintypes.HWND
     _u.WindowFromPoint.argtypes = [wintypes.POINT]
     _u.WindowFromPoint.restype = wintypes.HWND
+    _u.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    _u.GetWindow.restype = wintypes.HWND
+    _u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    _u.GetWindowLongW.restype = ctypes.c_long
     _u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
     _u.FindWindowW.restype = wintypes.HWND
     _u.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND,
@@ -43,7 +49,11 @@ if IS_WIN:
 _SWP_FLAGS = 0x0001 | 0x0002 | 0x0010  # NOSIZE | NOMOVE | NOACTIVATE
 _GA_ROOT = 2
 _DESKTOP_CLASSES = ("Progman", "WorkerW")
+_HWND_TOPMOST = -1
 _HWND_BOTTOM = 1
+_GW_HWNDPREV = 3
+_GWL_EXSTYLE = -20
+_WS_EX_TOPMOST = 0x00000008
 
 
 def _desktop_anchor():
@@ -62,6 +72,28 @@ def _desktop_anchor():
         return anchor or None
     except Exception:
         return None
+
+
+def _desktop_raised():
+    """桌面层是否被抬到普通窗口层最顶（即正处于「显示桌面」状态）。
+
+    判定：桌面图标层上方的窗口若全是置顶带窗口（或没有窗口），
+    说明桌面层已占据普通层最顶；只要上方存在一个非置顶窗口，
+    桌面层就还在普通层底部（正常状态）。
+    """
+    try:
+        anchor = _desktop_anchor()
+        if not anchor:
+            return False
+        above = _u.GetWindow(anchor, _GW_HWNDPREV)
+        while above:
+            ex = _u.GetWindowLongW(above, _GWL_EXSTYLE)
+            if not (ex & _WS_EX_TOPMOST):
+                return False  # 桌面层上方有普通窗口：未被抬起
+            above = _u.GetWindow(above, _GW_HWNDPREV)
+        return True
+    except Exception:
+        return False
 
 
 def pin_to_bottom(tk_widget):
@@ -92,6 +124,7 @@ class DesktopGuard:
         self.app = app
         self.interval = interval
         self._job = None
+        self._escaped = False  # 已用 TOPMOST 逃出「显示桌面」压盖，等待落回
 
     # ---------- 生命周期 ----------
     def start(self):
@@ -134,22 +167,27 @@ class DesktopGuard:
         _u.GetClassNameW(top_root, buf, 64)
         return top_root if buf.value in _DESKTOP_CLASSES else None
 
-    def _surface_over(self, desk_hwnd):
-        """浮出桌面：插到压盖组件的桌面层正上方。
-        只越过桌面层，不会抬到任何应用窗口之上；桌面还原后
-        桌面层掉回最底，组件随之落回「桌面之上、应用之下」。"""
+    def _escape(self):
+        """逃出桌面层压盖：抬入 TOPMOST 带（显示桌面期间应用窗口本就
+        不可见，短暂置顶不算遮挡）。不用 NOTOPMOST 落回——那会把组件
+        留在普通层最顶，遮挡之后显示的窗口。"""
         h = self._hwnd()
-        if not h or not desk_hwnd:
+        if not h:
             return
-        _u.SetWindowPos(h, wintypes.HWND(desk_hwnd), 0, 0, 0, 0,
+        _u.SetWindowPos(h, wintypes.HWND(_HWND_TOPMOST), 0, 0, 0, 0,
                         _SWP_FLAGS)
+        self._escaped = True
 
     def _poll(self):
         self._job = None
         try:
-            desk = self._covering_desktop()
-            if desk:
-                self._surface_over(desk)
+            if self._escaped:
+                # 显示桌面结束（桌面层落回）后，立刻落回置底位置
+                if not _desktop_raised():
+                    self._escaped = False
+                    pin_to_bottom(self.app.root)
+            elif self._covering_desktop():
+                self._escape()
         except Exception:
             pass
         try:
