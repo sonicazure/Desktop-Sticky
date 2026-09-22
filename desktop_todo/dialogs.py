@@ -29,8 +29,6 @@ def open_add_dialog(app):
     win.resizable(False, False)
     win.configure(bg=th["border"])
     win.transient(app.root)
-    if app.topmost:
-        win.attributes("-topmost", True)
     body = tk.Frame(win, bg=th["panel"], highlightthickness=0, bd=0)
     body.pack(padx=1, pady=1)
     inner = tk.Frame(body, bg=th["panel"])
@@ -103,8 +101,6 @@ def open_settings(app):
     win.resizable(False, False)
     win.configure(bg=th["panel"])
     win.transient(app.root)
-    if app.topmost:
-        win.attributes("-topmost", True)
     body = tk.Frame(win, bg=th["panel"])
     body.pack(padx=26, pady=(8, 14))
 
@@ -204,7 +200,7 @@ def open_settings(app):
                                                      pady=(sw_dy, 0))
 
     group("高级")
-    r, rc = row("窗口置顶")
+    r, rc = row("始终置顶")
     Switch(rc, on=app.topmost, command=app._apply_topmost,
            accent=th["accent"], bg=th["panel"]).pack(side="right",
                                                      padx=(0, 2),
@@ -266,8 +262,6 @@ def open_font_picker(app, anchor):
     win.transient(app.settings_win or app.root)   # ← 新增：浮在设置页之上
     win.overrideredirect(True)
     win.configure(bg=th["border"])
-    if app.topmost:
-        win.attributes("-topmost", True)
     body = tk.Frame(win, bg=th["panel"], highlightthickness=0, bd=0)
     body.pack(padx=1, pady=1)
     lb = tk.Listbox(

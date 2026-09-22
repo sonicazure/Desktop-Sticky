@@ -1,196 +1,444 @@
 # -*- coding: utf-8 -*-
-"""桌面层级守卫（仅 Windows）：不置顶（置底）模式下维持
-「桌面之上、应用窗口之下」的精确层级，并免疫 Win+D「显示桌面」。
+"""Click-driven Windows desktop layering; all Z-order changes belong here.
 
-原理：
-- 置底不是 SetWindowPos(HWND_BOTTOM) 一刀切——它可能把窗口压到
-  桌面层（Progman/WorkerW）之下导致不可见，层级语义也不精确。
-  正确做法是找到桌面图标层所在窗口（Progman，或 Win+D / 壁纸引擎时
-  承载 SHELLDLL_DefView 的 WorkerW），把组件插到它的【正上方】：
-  桌面层之上、所有普通窗口之下。
-- Win+D「显示桌面」会把桌面层抬到普通窗口层最顶。此时插在普通层
-  任何位置都会被桌面层压盖（系统维持桌面层在普通层最上），唯一
-  可靠的逃生通道是 TOPMOST 带——此刻应用窗口本就全部不可见，
-  短暂置顶不算遮挡。
-- 逃逸后进入「已逃逸」状态：轮询检测桌面层是否已落回（其上方
-  不再有非置顶窗口 = 显示桌面结束），一旦结束就把组件重新插回
-  桌面图标层正上方——落回「桌面之上、应用之下」，全程绝不会
-  停留在应用窗口之上（旧的 TOPMOST→NOTOPMOST 弹跳会把组件留在
-  普通层最顶遮挡其他窗口，是层级乱跳的根因）。
+A dedicated mouse-hook thread records the real hit window before activation.
+It never calls Tk. It consumes only a covered widget's activation click,
+including the matching release. The Tk thread handles state and repairs
+shell restacking without taking focus. Hovering never changes the layer.
 """
 import ctypes
+import logging
+import queue
 import sys
-from ctypes import wintypes
+import threading
+import time
+from ctypes import wintypes as W
 
 IS_WIN = sys.platform.startswith("win")
+log = logging.getLogger(__name__)
+FLAGS = 0x0001 | 0x0002 | 0x0010  # NOSIZE | NOMOVE | NOACTIVATE
+TOPMOST, NOTOPMOST, TOP = -1, -2, 0
+ROOT, NEXT, PREV, OWNER = 2, 2, 3, 4
+EXSTYLE, HWNDPARENT = -20, -8
+TOOLWINDOW, APPWINDOW = 0x80, 0x40000
+MOUSE_DOWN = {0x0201, 0x0204, 0x0207, 0x020B}
+MOUSE_UP = {0x0202: 0x0201, 0x0205: 0x0204,
+            0x0208: 0x0207, 0x020C: 0x020B}
+EXCLUDED_FROM_PEEK, CLOAKED, FRAME_BOUNDS = 12, 14, 9
 
 if IS_WIN:
-    _u = ctypes.windll.user32
-    # 必须显式声明签名：默认 int 转换会把 64 位 HWND 指针截断，
-    # 导致 SetWindowPos / 句柄比较静默失败（实测返回 0，层级纹丝不动）
-    _u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
-                                ctypes.c_int, ctypes.c_int,
-                                ctypes.c_int, ctypes.c_int, wintypes.UINT]
-    _u.SetWindowPos.restype = wintypes.BOOL
-    _u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-    _u.GetAncestor.restype = wintypes.HWND
-    _u.WindowFromPoint.argtypes = [wintypes.POINT]
-    _u.WindowFromPoint.restype = wintypes.HWND
-    _u.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
-    _u.GetWindow.restype = wintypes.HWND
-    _u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-    _u.GetWindowLongW.restype = ctypes.c_long
-    _u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-    _u.FindWindowW.restype = wintypes.HWND
-    _u.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND,
-                                 wintypes.LPCWSTR, wintypes.LPCWSTR]
-    _u.FindWindowExW.restype = wintypes.HWND
+    _u = ctypes.WinDLL("user32", use_last_error=True)
+    _k = ctypes.WinDLL("kernel32", use_last_error=True)
+    _dwm = ctypes.WinDLL("dwmapi", use_last_error=True)
 
-_SWP_FLAGS = 0x0001 | 0x0002 | 0x0010  # NOSIZE | NOMOVE | NOACTIVATE
-_GA_ROOT = 2
-_DESKTOP_CLASSES = ("Progman", "WorkerW")
-_HWND_TOPMOST = -1
-_HWND_BOTTOM = 1
-_GW_HWNDPREV = 3
-_GWL_EXSTYLE = -20
-_WS_EX_TOPMOST = 0x00000008
+    def _declare(dll, name, result, *args):
+        fn = getattr(dll, name)
+        fn.restype, fn.argtypes = result, list(args)
+        return fn
+
+    _declare(_u, "SetWindowPos", W.BOOL, W.HWND, W.HWND,
+             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, W.UINT)
+    for name in ("GetAncestor", "GetWindow"):
+        _declare(_u, name, W.HWND, W.HWND, W.UINT)
+    _declare(_u, "GetTopWindow", W.HWND, W.HWND)
+    _declare(_u, "GetShellWindow", W.HWND)
+    _declare(_u, "GetForegroundWindow", W.HWND)
+    _declare(_u, "WindowFromPoint", W.HWND, W.POINT)
+    _declare(_u, "WindowFromPhysicalPoint", W.HWND, W.POINT)
+    _declare(_u, "GetWindowRect", W.BOOL, W.HWND, ctypes.POINTER(W.RECT))
+    _declare(_u, "SetForegroundWindow", W.BOOL, W.HWND)
+    for name in ("DwmSetWindowAttribute", "DwmGetWindowAttribute"):
+        _declare(_dwm, name, ctypes.c_long, W.HWND, W.DWORD,
+                 ctypes.c_void_p, W.DWORD)
+    for name in ("IsWindow", "IsWindowVisible", "IsIconic"):
+        _declare(_u, name, W.BOOL, W.HWND)
+    _declare(_u, "ShowWindow", W.BOOL, W.HWND, ctypes.c_int)
+    _declare(_u, "GetClassNameW", ctypes.c_int, W.HWND, W.LPWSTR, ctypes.c_int)
+    _declare(_u, "GetWindowThreadProcessId", W.DWORD, W.HWND,
+             ctypes.POINTER(W.DWORD))
+    _suffix = "PtrW" if ctypes.sizeof(ctypes.c_void_p) == 8 else "W"
+    _get_long = _declare(_u, "GetWindowLong" + _suffix, ctypes.c_ssize_t,
+                         W.HWND, ctypes.c_int)
+    _set_long = _declare(_u, "SetWindowLong" + _suffix, ctypes.c_ssize_t,
+                         W.HWND, ctypes.c_int, ctypes.c_ssize_t)
+    _HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                  W.WPARAM, W.LPARAM)
+    _declare(_u, "SetWindowsHookExW", W.HANDLE, ctypes.c_int, _HOOKPROC,
+             W.HINSTANCE, W.DWORD)
+    _declare(_u, "CallNextHookEx", ctypes.c_ssize_t, W.HANDLE,
+             ctypes.c_int, W.WPARAM, W.LPARAM)
+    _declare(_u, "UnhookWindowsHookEx", W.BOOL, W.HANDLE)
+    _declare(_u, "GetMessageW", ctypes.c_int, ctypes.POINTER(W.MSG),
+             W.HWND, W.UINT, W.UINT)
+    _declare(_u, "PeekMessageW", W.BOOL, ctypes.POINTER(W.MSG),
+             W.HWND, W.UINT, W.UINT, W.UINT)
+    _declare(_u, "TranslateMessage", W.BOOL, ctypes.POINTER(W.MSG))
+    _declare(_u, "DispatchMessageW", ctypes.c_ssize_t, ctypes.POINTER(W.MSG))
+    _declare(_u, "PostThreadMessageW", W.BOOL, W.DWORD, W.UINT,
+             W.WPARAM, W.LPARAM)
+    _declare(_k, "GetCurrentThreadId", W.DWORD)
+    _declare(_k, "GetModuleHandleW", W.HMODULE, W.LPCWSTR)
+    _set_thread_dpi = None
+    if hasattr(_u, "SetThreadDpiAwarenessContext"):
+        _set_thread_dpi = _declare(_u, "SetThreadDpiAwarenessContext",
+                                   W.HANDLE, W.HANDLE)
+
+    class _MouseInfo(ctypes.Structure):
+        _fields_ = [("pt", W.POINT), ("mouseData", W.DWORD),
+                    ("flags", W.DWORD), ("time", W.DWORD),
+                    ("extra", ctypes.c_size_t)]
 
 
-def _desktop_anchor():
-    """桌面图标层所在窗口的 hwnd：Progman，或承载 SHELLDLL_DefView 的
-    WorkerW（Win+D / 壁纸软件会把桌面图标挪进某个 WorkerW）。
-    把组件插到它正上方 = 桌面之上、应用窗口之下。找不到返回 None。"""
-    try:
-        anchor = _u.FindWindowW("Progman", None)
-        worker = None
-        while True:
-            worker = _u.FindWindowExW(None, worker, "WorkerW", None)
-            if not worker:
-                break
-            if _u.FindWindowExW(worker, None, "SHELLDLL_DefView", None):
-                anchor = worker  # 桌面图标层在这个 WorkerW 里
-        return anchor or None
-    except Exception:
-        return None
+def _class_of(hwnd):
+    buf = ctypes.create_unicode_buffer(128)
+    _u.GetClassNameW(hwnd, buf, len(buf))
+    return buf.value
 
 
-def _desktop_raised():
-    """桌面层是否被抬到普通窗口层最顶（即正处于「显示桌面」状态）。
+def _windows():
+    """Bound enumeration even if Explorer is reordering windows."""
+    result, seen = [], set()
+    hwnd = _u.GetTopWindow(None)
+    while hwnd and hwnd not in seen:
+        seen.add(hwnd)
+        result.append(hwnd)
+        hwnd = _u.GetWindow(hwnd, NEXT)
+    return result
 
-    判定：桌面图标层上方的窗口若全是置顶带窗口（或没有窗口），
-    说明桌面层已占据普通层最顶；只要上方存在一个非置顶窗口，
-    桌面层就还在普通层底部（正常状态）。
+
+def _position(hwnd, after):
+    if not _u.SetWindowPos(hwnd, after, 0, 0, 0, 0, FLAGS):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _desktop_anchor(windows):
+    shell = _u.GetShellWindow()
+    if not shell:
+        return None  # Explorer restart: never fall back below the wallpaper.
+    pid = W.DWORD()
+    _u.GetWindowThreadProcessId(shell, ctypes.byref(pid))
+    for hwnd in windows:
+        other = W.DWORD()
+        _u.GetWindowThreadProcessId(hwnd, ctypes.byref(other))
+        if (other.value == pid.value and _u.IsWindowVisible(hwnd)
+                and _class_of(hwnd) in ("Progman", "WorkerW")):
+            return hwnd
+    return shell if shell in windows else None
+
+
+def _insert_above(hwnd, anchor):
+    # SetWindowPos inserts AFTER its argument, never above it.
+    previous = _u.GetWindow(anchor, PREV)
+    if previous == hwnd:
+        return
+    # Inserting after a topmost window would promote us. TOP avoids that.
+    if previous and _get_long(previous, EXSTYLE) & 0x8:
+        previous = TOP
+    _position(hwnd, previous or TOP)
+
+
+def _frame(hwnd):
+    rect = W.RECT()
+    # DWM bounds exclude invisible resize borders/shadows, unlike GetWindowRect.
+    if _dwm.DwmGetWindowAttribute(hwnd, FRAME_BOUNDS, ctypes.byref(rect),
+                                  ctypes.sizeof(rect)) != 0:
+        if not _u.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+    return rect
+
+
+def _overlaps(a, b):
+    return (a is not None and b is not None
+            and max(a.left, b.left) < min(a.right, b.right)
+            and max(a.top, b.top) < min(a.bottom, b.bottom))
+
+
+def _covered(hwnd, own):
+    """Inspect actual Z order before Windows activates the clicked window.
+
+    Only visible, non-cloaked foreign windows with overlapping content bounds
+    count. Mere inactivity or a window elsewhere on screen does not consume a
+    click. A completely covered window cannot be clicked through another app.
     """
-    try:
-        anchor = _desktop_anchor()
-        if not anchor:
+    rect = _frame(hwnd)
+    for other in _windows():
+        if other == hwnd:
+            break
+        if (other in own or not _u.IsWindowVisible(other)
+                or _u.IsIconic(other)
+                or _class_of(other) in ("Progman", "WorkerW")):
+            continue
+        cloaked = W.DWORD()
+        _dwm.DwmGetWindowAttribute(other, CLOAKED, ctypes.byref(cloaked),
+                                   ctypes.sizeof(cloaked))
+        if not cloaked.value and _overlaps(rect, _frame(other)):
+            return True
+    return False
+
+
+class _MouseWatcher:
+    def __init__(self, events, targets=()):
+        self.events = events
+        self.targets = tuple(targets)  # Immutable snapshots from the Tk thread.
+        self._eaten = set()
+        self.ready = threading.Event()
+        self.stopping = threading.Event()
+        self.thread_id = None
+        self.error = None
+        self.thread = threading.Thread(target=self._run, daemon=True,
+                                       name="Desktop click watcher")
+
+    def _click(self, message, info):
+        # Distinguish the two X buttons so a different release is not swallowed.
+        button = (info.mouseData >> 16) if message in (0x020B, 0x020C) else 0
+        key = (MOUSE_UP.get(message, message), button)
+        if message in MOUSE_UP:
+            if key in self._eaten:
+                self._eaten.remove(key)
+                return True
             return False
-        above = _u.GetWindow(anchor, _GW_HWNDPREV)
-        while above:
-            ex = _u.GetWindowLongW(above, _GWL_EXSTYLE)
-            if not (ex & _WS_EX_TOPMOST):
-                return False  # 桌面层上方有普通窗口：未被抬起
-            above = _u.GetWindow(above, _GW_HWNDPREV)
-        return True
-    except Exception:
-        return False
+        hit = _u.WindowFromPhysicalPoint(info.pt)
+        target = _u.GetAncestor(hit, ROOT) or hit
+        eat = target in self.targets and _covered(target, self.targets)
+        self.events.put((target, True) if eat else target)
+        if eat:
+            self._eaten.add(key)
+        return eat
 
+    def start(self):
+        self.thread.start()
+        if not self.ready.wait(2):
+            self.stop()
+            raise RuntimeError("Mouse watcher did not start")
+        if self.error:
+            raise self.error
 
-def pin_to_bottom(tk_widget):
-    """置底：把窗口插到桌面图标层正上方（桌面之上、所有普通窗口之下）。
+    def _run(self):
+        hook = None
+        try:
+            if _set_thread_dpi:
+                _set_thread_dpi(-4)  # PER_MONITOR_AWARE_V2, physical coordinates
+            self.thread_id = _k.GetCurrentThreadId()
+            msg = W.MSG()
+            _u.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
 
-    NOACTIVATE 不抢焦点，立即生效，之后打开的窗口天然压在它上方。
-    找不到桌面层时退化为 HWND_BOTTOM。非 Windows 平台静默返回 False。
-    """
-    if not IS_WIN:
-        return False
-    try:
-        h = _u.GetAncestor(tk_widget.winfo_id(), _GA_ROOT)
-        if not h:
-            return False
-        anchor = _desktop_anchor()
-        insert_after = wintypes.HWND(anchor) if anchor \
-            else wintypes.HWND(_HWND_BOTTOM)
-        return bool(_u.SetWindowPos(h, insert_after, 0, 0, 0, 0,
-                                    _SWP_FLAGS))
-    except Exception:
-        return False
+            @_HOOKPROC
+            def callback(code, message, data):
+                if code >= 0 and (message in MOUSE_DOWN or message in MOUSE_UP):
+                    info = ctypes.cast(data, ctypes.POINTER(_MouseInfo)).contents
+                    # Hook coordinates are physical, even for DPI-unaware Tk
+                    # threads; logical hit testing misidentifies scaled screens.
+                    try:
+                        if self._click(message, info):
+                            return 1
+                    except Exception:
+                        log.exception("Could not inspect activation click")
+                return _u.CallNextHookEx(None, code, message, data)
+
+            hook = _u.SetWindowsHookExW(
+                14, callback, _k.GetModuleHandleW(None), 0)
+            if not hook:
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.ready.set()
+            while not self.stopping.is_set():
+                result = _u.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result <= 0:
+                    break
+                _u.TranslateMessage(ctypes.byref(msg))
+                _u.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:
+            self.error = exc
+        finally:
+            self.ready.set()
+            if hook:
+                _u.UnhookWindowsHookEx(hook)
+
+    def stop(self):
+        self.stopping.set()
+        if self.thread_id:
+            _u.PostThreadMessageW(self.thread_id, 0x0012, 0, 0)  # WM_QUIT
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
 
 
 class DesktopGuard:
-    """轮询式守卫：仅在「不置顶（置底）」模式启用。"""
-
-    def __init__(self, app, interval=400):
+    def __init__(self, app, interval=20):
         self.app = app
         self.interval = interval
         self._job = None
-        self._escaped = False  # 已用 TOPMOST 逃出「显示桌面」压盖，等待落回
+        self._running = False
+        self._raised = False
+        self._always_on_top = bool(getattr(app, "topmost", False))
+        self._events = queue.SimpleQueue()
+        self._watcher = None
+        self._foreground = None
+        self._repair_at = 0
+        self._original = {}  # hwnd -> (owner, extended style)
+        self._peek_original = {}
+        self._failed = False
 
-    # ---------- 生命周期 ----------
+    def set_always_on_top(self, enabled):
+        """Switch policy immediately; keep Peek/Show Desktop protection alive."""
+        self._always_on_top = bool(enabled)
+        self._raised = self._always_on_top
+        # Clicks queued before toggling must not undo the new policy.
+        while not self._events.empty():
+            self._events.get()
+        if IS_WIN:
+            self._apply(self._handles())
+        else:
+            self.app.root.attributes("-topmost", self._always_on_top)
+        self._repair_at = 0
+
     def start(self):
-        if not IS_WIN or self._job is not None:
+        if not IS_WIN or self._running:
             return
+        self.app.root.update_idletasks()
+        self._watcher = _MouseWatcher(self._events, self._handles())
+        try:
+            self._watcher.start()
+        except Exception:
+            self._watcher.stop()
+            raise
+        self._running = True
+        self._foreground = _u.GetForegroundWindow()
         self._poll()
 
     def stop(self):
+        self._running = False
         if self._job is not None:
-            try:
-                self.app.root.after_cancel(self._job)
-            except Exception:
-                pass
+            self.app.root.after_cancel(self._job)
             self._job = None
+        if self._watcher:
+            self._watcher.stop()
+            self._watcher = None
+        for hwnd, (owner, style) in self._original.items():
+            if _u.IsWindow(hwnd):
+                _set_long(hwnd, HWNDPARENT, owner)
+                _set_long(hwnd, EXSTYLE, style)
+        self._original.clear()
+        for hwnd, value in self._peek_original.items():
+            if _u.IsWindow(hwnd):
+                flag = W.BOOL(value)
+                _dwm.DwmSetWindowAttribute(hwnd, EXCLUDED_FROM_PEEK,
+                                           ctypes.byref(flag), ctypes.sizeof(flag))
+        self._peek_original.clear()
 
-    # ---------- 内部 ----------
-    def _hwnd(self):
-        try:
-            return _u.GetAncestor(self.app.root.winfo_id(), _GA_ROOT)
-        except Exception:
-            return None
+    def _handles(self):
+        handles = []
+        for widget in (self.app.root, self.app.settings_win,
+                       self.app._add_win, self.app._font_picker):
+            if (widget and widget.winfo_exists()
+                    and (widget is self.app.root or widget.winfo_ismapped())):
+                hwnd = _u.GetAncestor(widget.winfo_id(), ROOT)
+                if hwnd and hwnd not in handles:
+                    handles.append(hwnd)
+        return handles
 
-    def _covering_desktop(self):
-        """压住组件中心点的桌面层 hwnd；未被桌面层压盖返回 None。"""
-        h = self._hwnd()
-        if not h:
-            return None
-        r = wintypes.RECT()
-        if not _u.GetWindowRect(h, ctypes.byref(r)):
-            return None
-        pt = wintypes.POINT(int((r.left + r.right) / 2),
-                            int((r.top + r.bottom) / 2))
-        top = _u.WindowFromPoint(pt)
-        if not top:
-            return None
-        top_root = _u.GetAncestor(top, _GA_ROOT)
-        if not top_root or top_root == h:
-            return None
-        buf = ctypes.create_unicode_buffer(64)
-        _u.GetClassNameW(top_root, buf, 64)
-        return top_root if buf.value in _DESKTOP_CLASSES else None
+    def _is_own(self, hwnd, handles):
+        seen = set()
+        while hwnd and hwnd not in seen:
+            if hwnd in handles:
+                return True
+            seen.add(hwnd)
+            hwnd = _u.GetWindow(hwnd, OWNER)
+        return False
 
-    def _escape(self):
-        """逃出桌面层压盖：抬入 TOPMOST 带（显示桌面期间应用窗口本就
-        不可见，短暂置顶不算遮挡）。不用 NOTOPMOST 落回——那会把组件
-        留在普通层最顶，遮挡之后显示的窗口。"""
-        h = self._hwnd()
-        if not h:
+    def _prepare(self, hwnd):
+        shell = _u.GetShellWindow()
+        if hwnd not in self._original:
+            self._original[hwnd] = (_get_long(hwnd, HWNDPARENT),
+                                    _get_long(hwnd, EXSTYLE))
+        # Keep a top-level HWND, not a reparented child: Tk geometry, DPI and
+        # transient dialogs remain intact. Reacquire a restarted Explorer.
+        if shell and _get_long(hwnd, HWNDPARENT) != shell:
+            ctypes.set_last_error(0)
+            _set_long(hwnd, HWNDPARENT, shell)
+            if ctypes.get_last_error():
+                raise ctypes.WinError(ctypes.get_last_error())
+        style = _get_long(hwnd, EXSTYLE)
+        desired = (style | TOOLWINDOW) & ~APPWINDOW
+        if desired != style:
+            ctypes.set_last_error(0)
+            _set_long(hwnd, EXSTYLE, desired)
+            if ctypes.get_last_error():
+                raise ctypes.WinError(ctypes.get_last_error())
+
+    def _apply(self, handles):
+        if not handles:
             return
-        _u.SetWindowPos(h, wintypes.HWND(_HWND_TOPMOST), 0, 0, 0, 0,
-                        _SWP_FLAGS)
-        self._escaped = True
+        main = handles[0]
+        self._prepare(main)
+        if self._watcher:
+            # Pinned mode allows direct interaction, with no activation click.
+            self._watcher.targets = () if self._always_on_top else tuple(handles)
+        for hwnd in handles:
+            self._exclude_from_peek(hwnd)
+        if _u.IsIconic(main):
+            _u.ShowWindow(main, 4)  # SW_SHOWNOACTIVATE
+        elif not _u.IsWindowVisible(main):
+            _u.ShowWindow(main, 8)  # SW_SHOWNA
+        if self._always_on_top or self._raised:
+            for hwnd in handles:
+                if self._always_on_top or not _get_long(hwnd, EXSTYLE) & 0x8:
+                    _position(hwnd, TOPMOST)
+            return
+        for hwnd in reversed(handles):
+            if _get_long(hwnd, EXSTYLE) & 0x8:
+                _position(hwnd, NOTOPMOST)
+        anchor = _desktop_anchor(_windows())
+        if anchor:
+            _insert_above(main, anchor)
+            for previous, hwnd in zip(handles, handles[1:]):
+                _insert_above(hwnd, previous)
+
+    def _exclude_from_peek(self, hwnd):
+        # This is a set-only DWM attribute (Get returns E_INVALIDARG). These
+        # are our own Tk windows, initially using Windows' default FALSE.
+        value = W.BOOL(True)
+        result = _dwm.DwmSetWindowAttribute(
+            hwnd, EXCLUDED_FROM_PEEK, ctypes.byref(value), ctypes.sizeof(value))
+        if result != 0:
+            raise OSError(f"DwmSetWindowAttribute failed: {result:#x}")
+        self._peek_original[hwnd] = False
 
     def _poll(self):
         self._job = None
+        if not self._running:
+            return
         try:
-            if self._escaped:
-                # 显示桌面结束（桌面层落回）后，立刻落回置底位置
-                if not _desktop_raised():
-                    self._escaped = False
-                    pin_to_bottom(self.app.root)
-            elif self._covering_desktop():
-                self._escape()
+            handles = self._handles()
+            clicked = False
+            activate = None
+            while not self._events.empty():
+                event = self._events.get()
+                target, swallowed = event if isinstance(event, tuple) else (event, False)
+                self._raised = self._is_own(target, handles)
+                activate = target if self._raised and swallowed else None
+                clicked = True
+            foreground = _u.GetForegroundWindow()
+            # Alt+Tab and launching another app also release the overlay.
+            if (not clicked and foreground != self._foreground and foreground
+                    and not self._is_own(foreground, handles)):
+                self._raised = False
+                clicked = True
+            self._foreground = foreground
+            if self._always_on_top:
+                self._raised = True
+            now = time.monotonic()
+            if clicked or now >= self._repair_at:
+                self._apply(handles)
+                if activate:
+                    # A covered window may already be in the topmost band,
+                    # underneath another topmost window. Explicitly reorder it.
+                    _position(activate, TOPMOST)
+                    _u.SetForegroundWindow(activate)
+                self._repair_at = now + 0.25
+            self._failed = False
         except Exception:
-            pass
-        try:
-            self._job = self.app.root.after(self.interval, self._poll)
-        except Exception:
-            pass  # 窗口已销毁
+            if not self._failed:
+                log.exception("Could not reconcile desktop window layers")
+            self._failed = True
+        finally:
+            if self._running:
+                self._job = self.app.root.after(self.interval, self._poll)

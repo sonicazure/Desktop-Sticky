@@ -3,8 +3,7 @@
 
 - 标题栏拖动移动，左 / 右 / 下 / 右下角贴边缩放（拖拽时每帧同步布局）
 - 透明度 0–100% 滑杆（有序抖动点阵）：底板与卡片底色淡出，文字实心
-- 置顶开关：置顶=浮在所有窗口之上；不置顶=置底（压到 Z 序最底，
-  不遮挡之后打开的窗口），点击激活后自动重新压底
+- 桌面常驻：平时位于应用之下，点击置顶，点击外部或切换应用后回归桌面
 - 双主题、行内编辑、删除/清除可撤销、双击标题栏折叠
 """
 import os
@@ -38,7 +37,6 @@ class TodoApp:
         self._restack_job = None
         self._heal_job = None
         self._warmup_job = None
-        self._pin_job = None
         self._last_cursor = None
         self._last_cw = 0
         self._undo_stack = []
@@ -70,8 +68,8 @@ class TodoApp:
         if self.font_size not in SIZE_CHOICES:
             self.font_size = 11
         self.font_bold = bool(self.config.get("font_bold", False))
+        self.topmost = bool(self.config.get("topmost", False))
         self.chrome_opacity = int(self.config.get("chrome_opacity", 100))
-        self.topmost = bool(self.config.get("topmost", True))
 
         self.root = tk.Tk()
         self.root.title("To-Do List")
@@ -116,19 +114,13 @@ class TodoApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
         self.root.bind("<Destroy>", self._on_destroy)
-        # 不置顶=置底：窗口被点击激活时 Windows 会把它抬到普通层最顶，
-        # 每次激活后重新压底，保持"不遮挡后来的窗口"
-        self.root.bind("<Activate>", lambda e: self._pin_bottom(), add="+")
         self._heal_job = self.root.after(800, self._heal_autostart)
         # 冷启动预热：界面落定后趁空闲把首交互路径预演一遍（详见 _warmup）
         self._warmup_job = self.root.after(350, self._warmup)
 
-        # 桌面防埋守卫：仅在非置顶时轮询，防止 Win+D「显示桌面」后
-        # 组件被桌面图层压盖且无法找回（置顶模式下系统本就免疫）
+        # 所有原生层级操作统一交给点击驱动的控制器。
         self._guard = dockguard.DesktopGuard(self)
-        if not self.topmost:
-            self._guard.start()
-            self.root.after(500, self._pin_bottom)  # 启动即置底
+        self._guard.start()
 
     # ========== 工具 ==========
     def lerp(self, c1, c2, t):
@@ -139,7 +131,7 @@ class TodoApp:
 
     def _cancel_jobs(self):
         for attr in ("_restack_job", "_save_after", "_undo_after",
-                     "_error_after", "_heal_job", "_warmup_job", "_pin_job"):
+                     "_error_after", "_heal_job", "_warmup_job"):
             job = getattr(self, attr, None)
             if job:
                 try:
@@ -1183,43 +1175,9 @@ class TodoApp:
         self._set_font(None, None, on)
 
     def _apply_topmost(self, on):
-        self.topmost = on
-        self.root.attributes("-topmost", on)
-        if self.settings_win and self.settings_win.winfo_exists():
-            self.settings_win.attributes("-topmost", on)
-        if self._guard:
-            if on:
-                self._guard.stop()    # 置顶模式天然免疫 Win+D
-            else:
-                self._guard.start()   # 非置顶：轮询防埋
-                self._pin_bottom()    # 不置顶 = 置底：立即压到 Z 序最底
+        self.topmost = bool(on)
+        self._guard.set_always_on_top(self.topmost)
         self._save_config()
-
-    # ---------- 置底（不置顶时的默认层级） ----------
-    def _pin_bottom(self):
-        """请求把主窗置底（桌面之上、应用窗口之下）。延迟执行：让点击
-        抬升先落定再压，避免与系统窗口管理抢序造成的闪烁。"""
-        if self.topmost or self._pin_job is not None:
-            return
-        try:
-            self._pin_job = self.root.after(80, self._do_pin_bottom)
-        except Exception:
-            pass
-
-    def _do_pin_bottom(self):
-        self._pin_job = None
-        if self.topmost:
-            return
-        # 弹窗（设置/新建/字体）打开期间不压底：transient 弹窗随主窗
-        # 沉底会被其他应用窗口盖住。轮询重试，弹窗关闭后自动补压。
-        for w in (self.settings_win, self._add_win, self._font_picker):
-            try:
-                if w and w.winfo_exists():
-                    self._pin_job = self.root.after(800, self._do_pin_bottom)
-                    return
-            except Exception:
-                return
-        dockguard.pin_to_bottom(self.root)
 
     def _apply_autostart(self, on):
         if not set_autostart(on):
